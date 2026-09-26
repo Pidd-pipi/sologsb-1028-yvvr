@@ -11,14 +11,23 @@ export interface PropertySpec {
   description: string;
 }
 
+export interface ExampleMigration {
+  fromRevision: number;
+  toRevision: number;
+  reason: string;
+  affectedItems: string[];
+  migratedAt: string;
+}
+
 export interface ComponentExample {
   id: string;
   title: string;
   code: string;
   propertyIds: string[];
-  stale: boolean;
-  staleReason: string;
-  createdFromRevision: number;
+  validatedRevision: number;
+  validatedSignature: string;
+  affectedItems: string[];
+  migrations: ExampleMigration[];
 }
 
 export interface ComponentSpec {

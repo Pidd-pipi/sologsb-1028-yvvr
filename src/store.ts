@@ -1,11 +1,72 @@
 import { createInitialState } from './data';
-import type { ComponentSnapshot, ComponentSpec, ValidationIssue, WorkspaceState } from './types';
+import { evaluateExample } from './staleness';
+import type { ComponentExample, ComponentSnapshot, ComponentSpec, ValidationIssue, WorkspaceState } from './types';
 
 const STORAGE_KEY = 'sologsb-1028-workspace-v1';
 
 const clone = <T>(value: T): T => structuredClone(value);
 const uid = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-const signature = (component: ComponentSpec) => `${component.properties.map((item) => `${item.name}:${item.required}`).join('|')}::${component.interactionSignature}`;
+
+const normalizeExample = (raw: any, componentRevision: number, componentSignature: string): ComponentExample => {
+  const legacyStale = Boolean(raw?.stale);
+  return {
+    id: String(raw?.id ?? uid('example')),
+    title: String(raw?.title ?? '示例'),
+    code: String(raw?.code ?? ''),
+    propertyIds: Array.isArray(raw?.propertyIds) ? raw.propertyIds.filter((id: unknown) => typeof id === 'string') : [],
+    validatedRevision: Number(raw?.validatedRevision ?? raw?.createdFromRevision ?? componentRevision),
+    validatedSignature: typeof raw?.validatedSignature === 'string'
+      ? raw.validatedSignature
+      : legacyStale ? `${componentSignature}（旧版）` : componentSignature,
+    affectedItems: Array.isArray(raw?.affectedItems) ? raw.affectedItems.filter((item: unknown) => typeof item === 'string') : [],
+    migrations: Array.isArray(raw?.migrations) ? raw.migrations : []
+  };
+};
+
+const normalizeComponent = (raw: any): ComponentSpec => {
+  const revision = Number(raw?.revision ?? 1);
+  const interactionSignature = String(raw?.interactionSignature ?? '');
+  const examples = (Array.isArray(raw?.examples) ? raw.examples : []).map((item: any) => normalizeExample(item, revision, interactionSignature));
+  const snapshots = (Array.isArray(raw?.snapshots) ? raw.snapshots : []).map((snapshot: any): ComponentSnapshot => {
+    const snapshotRevision = Number(snapshot?.revision ?? revision);
+    const snapshotSignature = String(snapshot?.component?.interactionSignature ?? '');
+    return {
+      revision: snapshotRevision,
+      savedAt: String(snapshot?.savedAt ?? new Date().toISOString()),
+      reason: String(snapshot?.reason ?? ''),
+      component: {
+        ...snapshot?.component,
+        properties: Array.isArray(snapshot?.component?.properties) ? snapshot.component.properties : [],
+        examples: (Array.isArray(snapshot?.component?.examples) ? snapshot.component.examples : [])
+          .map((item: any) => normalizeExample(item, snapshotRevision, snapshotSignature))
+      }
+    };
+  });
+  return {
+    id: String(raw?.id ?? uid('component')),
+    name: String(raw?.name ?? 'Untitled component'),
+    category: String(raw?.category ?? 'Uncategorised'),
+    status: raw?.status ?? 'draft',
+    purpose: String(raw?.purpose ?? ''),
+    usage: String(raw?.usage ?? ''),
+    properties: Array.isArray(raw?.properties) ? raw.properties : [],
+    states: String(raw?.states ?? ''),
+    keyboardBehavior: String(raw?.keyboardBehavior ?? ''),
+    screenReader: String(raw?.screenReader ?? ''),
+    disabledScenarios: String(raw?.disabledScenarios ?? ''),
+    interactionSignature,
+    examples,
+    revision,
+    updatedAt: String(raw?.updatedAt ?? new Date().toISOString()),
+    snapshots
+  };
+};
+
+const normalizeState = (raw: any): WorkspaceState => {
+  const components: ComponentSpec[] = (Array.isArray(raw?.components) ? raw.components : []).map(normalizeComponent);
+  const selectedId = components.some((item) => item.id === raw?.selectedId) ? raw.selectedId : components[0]?.id ?? '';
+  return { components, selectedId };
+};
 
 export class SpecStore extends EventTarget {
   state: WorkspaceState;
@@ -59,19 +120,13 @@ export class SpecStore extends EventTarget {
     });
   }
 
-  updateComponent(patch: Partial<ComponentSpec>, markExamplesStale = false) {
+  updateComponent(patch: Partial<ComponentSpec>) {
     const selected = this.selected;
     if (!selected) return;
     this.commit('编辑组件', (state) => {
       const target = state.components.find((item) => item.id === selected.id);
       if (!target) return;
       Object.assign(target, patch, { updatedAt: new Date().toISOString() });
-      if (markExamplesStale) {
-        target.examples.forEach((example) => {
-          example.stale = true;
-          example.staleReason = '组件交互或属性契约已修改，示例需要重新验证。';
-        });
-      }
     });
   }
 
@@ -96,7 +151,13 @@ export class SpecStore extends EventTarget {
     this.commit('编辑属性', (state) => {
       const target = state.components.find((item) => item.id === selected.id);
       const property = target?.properties.find((item) => item.id === propertyId);
-      if (target && property) Object.assign(property, patch);
+      if (!target || !property) return;
+      const previousName = property.name;
+      Object.assign(property, patch);
+      target.updatedAt = new Date().toISOString();
+      if (patch.name !== undefined && patch.name !== previousName && previousName.trim()) {
+        this.recordAffectedProperty(target, previousName);
+      }
     });
   }
 
@@ -108,12 +169,8 @@ export class SpecStore extends EventTarget {
       const property = target?.properties.find((item) => item.id === propertyId);
       if (!target || !property) return;
       target.properties = target.properties.filter((item) => item.id !== propertyId);
-      target.examples.forEach((example) => {
-        if (example.propertyIds.includes(propertyId) || example.code.includes(property.name)) {
-          example.stale = true;
-          example.staleReason = `属性 ${property.name} 已删除，示例代码或说明仍可能引用它。`;
-        }
-      });
+      target.updatedAt = new Date().toISOString();
+      this.recordAffectedProperty(target, property.name, property.id);
     });
   }
 
@@ -129,9 +186,10 @@ export class SpecStore extends EventTarget {
         title: '新示例',
         code: `<${target.name.toLowerCase().replaceAll(' ', '-')}>示例</${target.name.toLowerCase().replaceAll(' ', '-')}>`,
         propertyIds: [],
-        stale: false,
-        staleReason: '',
-        createdFromRevision: target.revision
+        validatedRevision: target.revision,
+        validatedSignature: target.interactionSignature,
+        affectedItems: [],
+        migrations: []
       });
     });
   }
@@ -176,23 +234,26 @@ export class SpecStore extends EventTarget {
     });
   }
 
-  migrateExamples() {
+  migrateExample(exampleId: string) {
     const selected = this.selected;
     if (!selected) return;
-    this.commit('迁移示例到当前版本', (state) => {
+    const example = selected.examples.find((item) => item.id === exampleId);
+    if (!example || !evaluateExample(selected, example).stale) return;
+    this.commit('迁移示例', (state) => {
+      const target = state.components.find((item) => item.id === selected.id);
+      const entry = target?.examples.find((item) => item.id === exampleId);
+      if (target && entry) this.migrateExampleRecord(target, entry);
+    });
+  }
+
+  migrateStaleExamples() {
+    const selected = this.selected;
+    if (!selected) return;
+    if (!selected.examples.some((example) => evaluateExample(selected, example).stale)) return;
+    this.commit('迁移待迁移示例', (state) => {
       const target = state.components.find((item) => item.id === selected.id);
       if (!target) return;
-      const currentSignature = signature(target);
-      const activePropertyIds = new Set(target.properties.map((item) => item.id));
-      target.examples.forEach((example) => {
-        example.propertyIds = example.propertyIds.filter((id) => activePropertyIds.has(id));
-        example.stale = false;
-        example.staleReason = '';
-        example.createdFromRevision = target.revision;
-      });
-      target.interactionSignature = currentSignature.split('::')[1] ?? target.interactionSignature;
-      target.revision += 1;
-      target.updatedAt = new Date().toISOString();
+      target.examples.forEach((example) => this.migrateExampleRecord(target, example));
     });
   }
 
@@ -206,11 +267,12 @@ export class SpecStore extends EventTarget {
           issues.push({ id: `${component.id}-duplicate-${name}`, level: 'error', componentId: component.id, target: component.name, message: `属性名称 ${name} 重复。`, field: 'properties' });
         }
       }
-      const contractChanged = component.examples.some((example) => example.createdFromRevision < component.revision);
+      let staleCount = 0;
       component.examples.forEach((example) => {
-        const missingReferences = example.propertyIds.filter((id) => !component.properties.some((property) => property.id === id));
-        if (example.stale || missingReferences.length) {
-          issues.push({ id: `${component.id}-${example.id}-stale`, level: 'warning', componentId: component.id, target: example.title, message: example.staleReason || '示例引用了已删除属性。', field: 'examples' });
+        const staleness = evaluateExample(component, example);
+        if (staleness.stale) {
+          staleCount += 1;
+          issues.push({ id: `${component.id}-${example.id}-stale`, level: 'warning', componentId: component.id, target: example.title, message: staleness.reasons.join(' '), field: 'examples' });
         }
         if (!example.code.trim()) {
           issues.push({ id: `${component.id}-${example.id}-empty`, level: 'error', componentId: component.id, target: example.title, message: '示例代码不能为空。', field: 'examples' });
@@ -222,8 +284,8 @@ export class SpecStore extends EventTarget {
       if (!component.screenReader.trim()) {
         issues.push({ id: `${component.id}-screenreader`, level: 'error', componentId: component.id, target: component.name, message: '缺少读屏说明。', field: 'screenReader' });
       }
-      if (contractChanged && component.examples.length) {
-        issues.push({ id: `${component.id}-contract`, level: 'info', componentId: component.id, target: component.name, message: '属性契约或交互签名发生变化，建议创建快照并迁移示例。', field: 'properties' });
+      if (staleCount) {
+        issues.push({ id: `${component.id}-contract`, level: 'info', componentId: component.id, target: component.name, message: `${staleCount} 份示例待迁移；逐份迁移会记录原校验版本与原因，其余示例不受影响。`, field: 'examples' });
       }
     }
     return issues;
@@ -255,6 +317,33 @@ export class SpecStore extends EventTarget {
     this.emit();
   }
 
+  private recordAffectedProperty(component: ComponentSpec, name: string, removedId?: string) {
+    component.examples.forEach((example) => {
+      const references = example.code.includes(name) || (removedId !== undefined && example.propertyIds.includes(removedId));
+      if (references && name && !example.affectedItems.includes(name)) {
+        example.affectedItems = [...example.affectedItems, name];
+      }
+    });
+  }
+
+  private migrateExampleRecord(component: ComponentSpec, example: ComponentExample) {
+    const staleness = evaluateExample(component, example);
+    if (!staleness.stale) return;
+    const activePropertyIds = new Set(component.properties.map((item) => item.id));
+    example.migrations.unshift({
+      fromRevision: example.validatedRevision,
+      toRevision: component.revision,
+      reason: staleness.reasons.join(' '),
+      affectedItems: staleness.affectedItems,
+      migratedAt: new Date().toISOString()
+    });
+    example.propertyIds = example.propertyIds.filter((id) => activePropertyIds.has(id));
+    example.validatedRevision = component.revision;
+    example.validatedSignature = component.interactionSignature;
+    example.affectedItems = [];
+    component.updatedAt = new Date().toISOString();
+  }
+
   private commit(label: string, mutator: (state: WorkspaceState) => void) {
     const before = clone(this.state);
     const next = clone(this.state);
@@ -271,7 +360,7 @@ export class SpecStore extends EventTarget {
   private load(): WorkspaceState {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) return JSON.parse(saved) as WorkspaceState;
+      if (saved) return normalizeState(JSON.parse(saved));
     } catch {
       // A corrupted local draft falls back to the bundled demo data.
     }

@@ -26,18 +26,20 @@ const components: ComponentSpec[] = [
         title: '保存表单',
         code: '<sp-button variant="accent">保存</sp-button>',
         propertyIds: ['p-label', 'p-variant'],
-        stale: false,
-        staleReason: '',
-        createdFromRevision: 3
+        validatedRevision: 3,
+        validatedSignature: 'Space/Enter 触发；disabled 时不响应',
+        affectedItems: [],
+        migrations: []
       },
       {
         id: 'example-button-disabled',
         title: '不可用状态',
         code: '<sp-button disabled>等待校验</sp-button>',
         propertyIds: ['p-label', 'p-disabled'],
-        stale: false,
-        staleReason: '',
-        createdFromRevision: 3
+        validatedRevision: 3,
+        validatedSignature: 'Space/Enter 触发；disabled 时不响应',
+        affectedItems: [],
+        migrations: []
       }
     ],
     revision: 3,
@@ -67,9 +69,10 @@ const components: ComponentSpec[] = [
         title: '必填组件名称',
         code: '<sp-field-label for="name">组件名称</sp-field-label>\n<sp-textfield id="name" required></sp-textfield>',
         propertyIds: ['p-field-label', 'p-field-required'],
-        stale: false,
-        staleReason: '',
-        createdFromRevision: 2
+        validatedRevision: 2,
+        validatedSignature: 'Tab 聚焦；invalid 时 aria-invalid=true',
+        affectedItems: [],
+        migrations: []
       }
     ],
     revision: 2,
@@ -99,9 +102,10 @@ const components: ComponentSpec[] = [
         title: '删除确认',
         code: '<sp-dialog open modal heading="删除组件？">\n  <sp-button slot="button" variant="negative">删除</sp-button>\n</sp-dialog>',
         propertyIds: ['p-dialog-open', 'p-dialog-title', 'p-dialog-modal'],
-        stale: true,
-        staleReason: '交互签名较上版发生变化，请确认焦点恢复与 Esc 行为。',
-        createdFromRevision: 1
+        validatedRevision: 1,
+        validatedSignature: 'Esc 关闭（旧版签名）',
+        affectedItems: [],
+        migrations: []
       }
     ],
     revision: 2,
