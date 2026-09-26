@@ -1,6 +1,7 @@
 import { LitElement, css, html, nothing, type TemplateResult } from 'lit';
 import { repeat } from 'lit/directives/repeat.js';
 import { diffAgainstSnapshot } from './diff';
+import { getExampleStaleness } from './staleness';
 import { SpecStore } from './store';
 import type { ComponentExample, ComponentSpec, PreviewDensity, PreviewTheme, PropertySpec, ValidationIssue } from './types';
 
@@ -67,6 +68,8 @@ export class SpecA11yWorkbench extends LitElement {
     .pill { display: inline-flex; align-items: center; border-radius: 999px; padding: 2px 7px; font-size: 10px; font-weight: 700; background: var(--spectrum-gray-300); }
     .pill.published { background: var(--spectrum-green-300); }
     .pill.review { background: var(--spectrum-orange-300); }
+    .stale-count { color: var(--spectrum-orange-800); font-weight: 700; }
+    .migration-log { display: grid; gap: 2px; margin: 8px 0; }
     .main { min-width: 0; padding: 22px; }
     .title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 15px; margin-bottom: 16px; }
     .title-row h2 { font-size: 28px; margin: 0; letter-spacing: -.035em; }
@@ -220,7 +223,7 @@ export class SpecA11yWorkbench extends LitElement {
                       <span>${item.name}</span>
                       <span class="pill ${item.status}">${this.statusLabel(item.status)}</span>
                     </span>
-                    <span class="item-meta">${item.category} · ${item.properties.length} 个属性 · ${item.examples.length} 个示例</span>
+                    <span class="item-meta">${item.category} · ${item.properties.length} 个属性 · ${item.examples.length} 个示例${this.staleExampleCount(item) ? html` · <span class="stale-count">${this.staleExampleCount(item)} 待迁移</span>` : nothing}</span>
                   </button>
                 `) : html`<div class="search-empty">没有匹配的组件。可尝试属性名、键盘行为或代码文本。</div>`}
               </div>
@@ -252,7 +255,6 @@ export class SpecA11yWorkbench extends LitElement {
             <option value="published">已发布</option>
           </select>
           <sp-button variant="secondary" @click=${() => this.store.createSnapshot('编辑器保存')}>保存快照</sp-button>
-          ${this.hasStaleExamples(component) ? html`<sp-button variant="accent" @click=${() => { this.store.migrateExamples(); this.flash('示例已迁移到当前契约'); }}>迁移示例</sp-button>` : nothing}
         </div>
       </div>
       <div class="tabs" role="tablist" aria-label="编辑区域">
@@ -300,7 +302,7 @@ export class SpecA11yWorkbench extends LitElement {
         </div>
         <div class="form-grid" style="margin-top: 18px">
           <label class="field full"><span>状态说明</span><textarea .value=${component.states} @change=${(event: Event) => this.store.updateComponent({ states: (event.currentTarget as HTMLTextAreaElement).value })}></textarea></label>
-          <label class="field full"><span>交互签名（修改后会标记关联示例失效）</span><textarea .value=${component.interactionSignature} @change=${(event: Event) => this.store.updateComponent({ interactionSignature: (event.currentTarget as HTMLTextAreaElement).value }, true)}></textarea></label>
+          <label class="field full"><span>交互签名（变更后，按旧签名校验的示例会逐份标记为待迁移）</span><textarea .value=${component.interactionSignature} @change=${(event: Event) => this.store.updateComponent({ interactionSignature: (event.currentTarget as HTMLTextAreaElement).value })}></textarea></label>
         </div>
       </section>
     `;
@@ -328,7 +330,7 @@ export class SpecA11yWorkbench extends LitElement {
     return html`
       <section class="panel">
         <div class="form-grid">
-          <label class="field full"><span>键盘行为</span><textarea .value=${component.keyboardBehavior} @change=${(event: Event) => this.store.updateComponent({ keyboardBehavior: (event.currentTarget as HTMLTextAreaElement).value }, true)}></textarea></label>
+          <label class="field full"><span>键盘行为</span><textarea .value=${component.keyboardBehavior} @change=${(event: Event) => this.store.updateComponent({ keyboardBehavior: (event.currentTarget as HTMLTextAreaElement).value })}></textarea></label>
           <label class="field full"><span>读屏说明</span><textarea .value=${component.screenReader} @change=${(event: Event) => this.store.updateComponent({ screenReader: (event.currentTarget as HTMLTextAreaElement).value })}></textarea></label>
           <label class="field full"><span>禁用场景</span><textarea .value=${component.disabledScenarios} @change=${(event: Event) => this.store.updateComponent({ disabledScenarios: (event.currentTarget as HTMLTextAreaElement).value })}></textarea></label>
         </div>
@@ -351,15 +353,24 @@ export class SpecA11yWorkbench extends LitElement {
   }
 
   private renderExample(component: ComponentSpec, example: ComponentExample): TemplateResult {
+    const staleness = getExampleStaleness(component, example);
     return html`
       <article class="example-card">
         <div class="example-head">
           <strong>${example.title}</strong>
-          <span class="pill ${example.stale ? 'review' : 'published'}">${example.stale ? '需要迁移' : `r${example.createdFromRevision}`}</span>
+          <span class="pill ${staleness.stale ? 'review' : 'published'}">${staleness.stale ? '需要迁移' : `r${example.validatedRevision}`}</span>
+          ${staleness.stale ? html`<sp-action-button size="s" label="迁移到当前契约" @click=${() => { this.store.migrateExample(example.id); this.flash(`已迁移「${example.title}」到 r${component.revision}`); }}>迁移</sp-action-button>` : nothing}
           <sp-action-button size="s" label="复制代码" @click=${() => this.copy(example.code)}>复制</sp-action-button>
           <sp-action-button size="s" label="删除示例" @click=${() => this.store.removeExample(example.id)}>删除</sp-action-button>
         </div>
-        ${example.stale ? html`<div class="issue warning"><strong>关联失效</strong>${example.staleReason}</div>` : nothing}
+        <span class="item-meta">校验版本 r${example.validatedRevision} · 受影响项：${example.affectedProperties.length ? example.affectedProperties.join('、') : '无'}</span>
+        ${staleness.stale ? html`
+          <div class="issue warning">
+            <strong>待迁移 · 当前契约 r${component.revision}</strong>
+            ${staleness.reasons.map((reason) => html`<div>${reason}</div>`)}
+          </div>
+        ` : nothing}
+        ${this.renderMigrations(example)}
         <div class="form-grid">
           <label class="field full"><span>标题</span><input type="text" .value=${example.title} @change=${(event: Event) => this.store.updateExample(example.id, { title: (event.currentTarget as HTMLInputElement).value })} /></label>
           <label class="field full"><span>代码</span><textarea .value=${example.code} @change=${(event: Event) => this.store.updateExample(example.id, { code: (event.currentTarget as HTMLTextAreaElement).value })}></textarea></label>
@@ -382,9 +393,27 @@ export class SpecA11yWorkbench extends LitElement {
     `;
   }
 
+  private renderMigrations(example: ComponentExample): TemplateResult | typeof nothing {
+    if (!example.migrations.length) return nothing;
+    return html`
+      <div class="migration-log">
+        ${example.migrations.slice(0, 2).map((migration) => html`
+          <div class="issue info">
+            <strong>迁移 r${migration.fromRevision} → r${migration.toRevision} · ${new Date(migration.migratedAt).toLocaleString('zh-CN')}</strong>
+            ${migration.reasons.map((reason) => html`<div>${reason}</div>`)}
+          </div>
+        `)}
+        ${example.migrations.length > 2 ? html`<span class="item-meta">另有 ${example.migrations.length - 2} 条更早的迁移记录。</span>` : nothing}
+      </div>
+    `;
+  }
+
   private renderHistory(component: ComponentSpec): TemplateResult {
     const snapshot = component.snapshots[0];
     const rows = diffAgainstSnapshot(component, snapshot);
+    const staleExamples = component.examples
+      .map((example) => ({ example, staleness: getExampleStaleness(component, example) }))
+      .filter((entry) => entry.staleness.stale);
     return html`
       <section class="panel">
         <div class="property-head">
@@ -396,7 +425,17 @@ export class SpecA11yWorkbench extends LitElement {
           <h3>与最近快照的差异</h3>
           ${rows.length ? html`<div class="diff">${rows.map((row) => html`<div class="diff-row"><b>${row.field}</b><span class="before">- ${row.before || '（空）'}</span><br /><span class="after">+ ${row.after || '（空）'}</span></div>`)}</div>` : html`<div class="issue info">当前内容与最近快照一致。</div>`}
         ` : html`<div class="empty">保存一次版本后即可比较字段、属性和示例变化。</div>`}
-        ${this.hasStaleExamples(component) ? html`<div class="issue warning" style="margin-top: 14px"><strong>检测到待迁移示例</strong>迁移会保留代码内容，清理已删除属性引用并更新契约版本。<br /><button @click=${() => this.store.migrateExamples()}>立即迁移</button></div>` : nothing}
+        ${staleExamples.length ? html`
+          <h3>待迁移示例（${staleExamples.length}）</h3>
+          ${staleExamples.map(({ example, staleness }) => html`
+            <div class="issue warning">
+              <strong>${example.title} · 校验版本 r${example.validatedRevision} → 当前契约 r${component.revision}</strong>
+              ${staleness.reasons.map((reason) => html`<div>${reason}</div>`)}
+              <button @click=${() => { this.store.migrateExample(example.id); this.flash(`已迁移「${example.title}」到 r${component.revision}`); }}>迁移到当前契约</button>
+            </div>
+          `)}
+          <p class="item-meta">迁移逐份进行：仅更新该示例的校验版本、签名与受影响项，其它示例和已保存快照不变。</p>
+        ` : nothing}
       </section>
     `;
   }
@@ -443,8 +482,8 @@ export class SpecA11yWorkbench extends LitElement {
     return this.store.state.components.filter((component) => JSON.stringify(component).toLowerCase().includes(query));
   }
 
-  private hasStaleExamples(component: ComponentSpec): boolean {
-    return component.examples.some((example) => example.stale);
+  private staleExampleCount(component: ComponentSpec): number {
+    return component.examples.filter((example) => getExampleStaleness(component, example).stale).length;
   }
 
   private statusLabel(status: ComponentSpec['status']): string {

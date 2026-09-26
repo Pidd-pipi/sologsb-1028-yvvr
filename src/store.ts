@@ -1,11 +1,43 @@
 import { createInitialState } from './data';
-import type { ComponentSnapshot, ComponentSpec, ValidationIssue, WorkspaceState } from './types';
+import { collectAffectedProperties, getExampleStaleness } from './staleness';
+import type { ComponentExample, ComponentSnapshot, ComponentSpec, ValidationIssue, WorkspaceState } from './types';
 
 const STORAGE_KEY = 'sologsb-1028-workspace-v1';
 
 const clone = <T>(value: T): T => structuredClone(value);
 const uid = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-const signature = (component: ComponentSpec) => `${component.properties.map((item) => `${item.name}:${item.required}`).join('|')}::${component.interactionSignature}`;
+
+/** 兼容旧版本地数据：把 stale/createdFromRevision 结构升级为逐份校验记录。 */
+const normalizeExample = (component: ComponentSpec, raw: Partial<ComponentExample> & { stale?: boolean; createdFromRevision?: number }): ComponentExample => {
+  if (typeof raw.validatedRevision === 'number' && Array.isArray(raw.affectedProperties)) {
+    return { ...raw, migrations: Array.isArray(raw.migrations) ? raw.migrations : [] } as ComponentExample;
+  }
+  const base = {
+    id: raw.id ?? uid('example'),
+    title: raw.title ?? '示例',
+    code: raw.code ?? '',
+    propertyIds: Array.isArray(raw.propertyIds) ? raw.propertyIds : []
+  };
+  return {
+    ...base,
+    validatedRevision: typeof raw.createdFromRevision === 'number' ? raw.createdFromRevision : component.revision,
+    // 旧数据没有记录当时的签名；已失效示例置空以保持待迁移状态。
+    validatedSignature: raw.stale ? '' : component.interactionSignature,
+    affectedProperties: collectAffectedProperties(component, base),
+    migrations: []
+  };
+};
+
+const normalizeComponent = (raw: ComponentSpec): ComponentSpec => {
+  const component: ComponentSpec = { ...raw, properties: raw.properties ?? [], examples: [] };
+  component.examples = (raw.examples ?? []).map((example) => normalizeExample(component, example));
+  component.snapshots = (raw.snapshots ?? []).map((snapshot) => {
+    const snapshotComponent = { ...snapshot.component, properties: snapshot.component.properties ?? [], examples: [] as ComponentExample[] };
+    snapshotComponent.examples = (snapshot.component.examples ?? []).map((example) => normalizeExample(snapshotComponent as ComponentSpec, example));
+    return { ...snapshot, component: snapshotComponent };
+  });
+  return component;
+};
 
 export class SpecStore extends EventTarget {
   state: WorkspaceState;
@@ -59,19 +91,13 @@ export class SpecStore extends EventTarget {
     });
   }
 
-  updateComponent(patch: Partial<ComponentSpec>, markExamplesStale = false) {
+  updateComponent(patch: Partial<ComponentSpec>) {
     const selected = this.selected;
     if (!selected) return;
     this.commit('编辑组件', (state) => {
       const target = state.components.find((item) => item.id === selected.id);
       if (!target) return;
       Object.assign(target, patch, { updatedAt: new Date().toISOString() });
-      if (markExamplesStale) {
-        target.examples.forEach((example) => {
-          example.stale = true;
-          example.staleReason = '组件交互或属性契约已修改，示例需要重新验证。';
-        });
-      }
     });
   }
 
@@ -105,44 +131,47 @@ export class SpecStore extends EventTarget {
     if (!selected) return;
     this.commit('删除属性', (state) => {
       const target = state.components.find((item) => item.id === selected.id);
-      const property = target?.properties.find((item) => item.id === propertyId);
-      if (!target || !property) return;
+      if (!target) return;
       target.properties = target.properties.filter((item) => item.id !== propertyId);
-      target.examples.forEach((example) => {
-        if (example.propertyIds.includes(propertyId) || example.code.includes(property.name)) {
-          example.stale = true;
-          example.staleReason = `属性 ${property.name} 已删除，示例代码或说明仍可能引用它。`;
-        }
-      });
+      // 不改动示例：失效由每份示例保存的受影响项派生判断。
     });
   }
 
   addExample() {
     const selected = this.selected;
     if (!selected) return;
-    const exampleId = uid('example');
     this.commit('新增示例', (state) => {
       const target = state.components.find((item) => item.id === selected.id);
       if (!target) return;
-      target.examples.push({
-        id: exampleId,
+      const example: ComponentExample = {
+        id: uid('example'),
         title: '新示例',
         code: `<${target.name.toLowerCase().replaceAll(' ', '-')}>示例</${target.name.toLowerCase().replaceAll(' ', '-')}>`,
         propertyIds: [],
-        stale: false,
-        staleReason: '',
-        createdFromRevision: target.revision
-      });
+        validatedRevision: target.revision,
+        validatedSignature: target.interactionSignature,
+        affectedProperties: [],
+        migrations: []
+      };
+      example.affectedProperties = collectAffectedProperties(target, example);
+      target.examples.push(example);
     });
   }
 
-  updateExample(exampleId: string, patch: Partial<ComponentSpec['examples'][number]>) {
+  updateExample(exampleId: string, patch: Partial<ComponentExample>) {
     const selected = this.selected;
     if (!selected) return;
     this.commit('编辑示例', (state) => {
       const target = state.components.find((item) => item.id === selected.id);
       const example = target?.examples.find((item) => item.id === exampleId);
-      if (example) Object.assign(example, patch);
+      if (!target || !example) return;
+      Object.assign(example, patch);
+      if ('code' in patch || 'propertyIds' in patch) {
+        // 编辑示例即重新评估其引用：清理已删除属性的关联，并刷新受影响项。
+        const activePropertyIds = new Set(target.properties.map((item) => item.id));
+        example.propertyIds = example.propertyIds.filter((id) => activePropertyIds.has(id));
+        example.affectedProperties = collectAffectedProperties(target, example, example.affectedProperties);
+      }
     });
   }
 
@@ -176,22 +205,27 @@ export class SpecStore extends EventTarget {
     });
   }
 
-  migrateExamples() {
+  migrateExample(exampleId: string) {
     const selected = this.selected;
     if (!selected) return;
-    this.commit('迁移示例到当前版本', (state) => {
+    this.commit('迁移示例到当前契约', (state) => {
       const target = state.components.find((item) => item.id === selected.id);
-      if (!target) return;
-      const currentSignature = signature(target);
+      const example = target?.examples.find((item) => item.id === exampleId);
+      if (!target || !example) return;
+      const staleness = getExampleStaleness(target, example);
       const activePropertyIds = new Set(target.properties.map((item) => item.id));
-      target.examples.forEach((example) => {
-        example.propertyIds = example.propertyIds.filter((id) => activePropertyIds.has(id));
-        example.stale = false;
-        example.staleReason = '';
-        example.createdFromRevision = target.revision;
+      // 逐份记录原校验版本与失效原因，再更新到当前契约；不动其它示例和快照。
+      example.migrations.unshift({
+        id: uid('migration'),
+        fromRevision: example.validatedRevision,
+        toRevision: target.revision,
+        reasons: staleness.reasons.length ? staleness.reasons : ['手动重新校验到当前契约。'],
+        migratedAt: new Date().toISOString()
       });
-      target.interactionSignature = currentSignature.split('::')[1] ?? target.interactionSignature;
-      target.revision += 1;
+      example.propertyIds = example.propertyIds.filter((id) => activePropertyIds.has(id));
+      example.validatedRevision = target.revision;
+      example.validatedSignature = target.interactionSignature;
+      example.affectedProperties = collectAffectedProperties(target, example);
       target.updatedAt = new Date().toISOString();
     });
   }
@@ -206,11 +240,10 @@ export class SpecStore extends EventTarget {
           issues.push({ id: `${component.id}-duplicate-${name}`, level: 'error', componentId: component.id, target: component.name, message: `属性名称 ${name} 重复。`, field: 'properties' });
         }
       }
-      const contractChanged = component.examples.some((example) => example.createdFromRevision < component.revision);
       component.examples.forEach((example) => {
-        const missingReferences = example.propertyIds.filter((id) => !component.properties.some((property) => property.id === id));
-        if (example.stale || missingReferences.length) {
-          issues.push({ id: `${component.id}-${example.id}-stale`, level: 'warning', componentId: component.id, target: example.title, message: example.staleReason || '示例引用了已删除属性。', field: 'examples' });
+        const staleness = getExampleStaleness(component, example);
+        if (staleness.stale) {
+          issues.push({ id: `${component.id}-${example.id}-stale`, level: 'warning', componentId: component.id, target: example.title, message: staleness.reasons.join(' '), field: 'examples' });
         }
         if (!example.code.trim()) {
           issues.push({ id: `${component.id}-${example.id}-empty`, level: 'error', componentId: component.id, target: example.title, message: '示例代码不能为空。', field: 'examples' });
@@ -221,9 +254,6 @@ export class SpecStore extends EventTarget {
       }
       if (!component.screenReader.trim()) {
         issues.push({ id: `${component.id}-screenreader`, level: 'error', componentId: component.id, target: component.name, message: '缺少读屏说明。', field: 'screenReader' });
-      }
-      if (contractChanged && component.examples.length) {
-        issues.push({ id: `${component.id}-contract`, level: 'info', componentId: component.id, target: component.name, message: '属性契约或交互签名发生变化，建议创建快照并迁移示例。', field: 'properties' });
       }
     }
     return issues;
@@ -271,7 +301,10 @@ export class SpecStore extends EventTarget {
   private load(): WorkspaceState {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) return JSON.parse(saved) as WorkspaceState;
+      if (saved) {
+        const parsed = JSON.parse(saved) as WorkspaceState;
+        return { ...parsed, components: (parsed.components ?? []).map(normalizeComponent) };
+      }
     } catch {
       // A corrupted local draft falls back to the bundled demo data.
     }
